@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KanadeSim · three-city spike</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --hud-bg: rgba(15, 18, 24, 0.78);
+        --hud-fg: #e8edf2;
+        --hud-accent: #7fd1ff;
+        --hud-warn: #ffb84d;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b0d12;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: var(--hud-fg);
+      }
+      #app {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+      }
+      canvas#scene {
+        display: block;
+        width: 100%;
+        height: 100%;
+        image-rendering: pixelated;
+      }
+      #hud {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        padding: 10px 14px;
+        background: var(--hud-bg);
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.55;
+        pointer-events: none;
+        backdrop-filter: blur(6px);
+        min-width: 200px;
+      }
+      #hud h1 {
+        margin: 0 0 6px 0;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--hud-accent);
+        letter-spacing: 0.5px;
+      }
+      #hud dl {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 2px 12px;
+        margin: 0;
+      }
+      #hud dt { color: #9aa3ad; }
+      #hud dd { margin: 0; font-variant-numeric: tabular-nums; }
+      #hud .ok { color: #6dd58c; }
+      #hud .warn { color: var(--hud-warn); }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+      <div id="clock" style="position:absolute;top:12px;right:14px;padding:8px 14px;background:rgba(15,18,24,0.78);border-radius:8px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:22px;font-weight:600;letter-spacing:1px;color:#fdd06a;backdrop-filter:blur(6px);">
+        <div style="font-size:10px;color:#9aa3ad;font-weight:400;letter-spacing:0.5px;text-align:right;">CITY TIME</div>
+        <div id="clock-text">--:--</div>
+        <div id="clock-phase" style="font-size:10px;color:#9aa3ad;font-weight:400;text-align:right;">—</div>
+      </div>
+      <div id="hud">
+        <h1>three-city · A1</h1>
+        <dl>
+          <dt>状态</dt><dd id="hud-status">loading…</dd>
+          <dt>FPS</dt><dd id="hud-fps">—</dd>
+          <dt>Renderer</dt><dd id="hud-renderer">—</dd>
+          <dt>Resolution</dt><dd id="hud-resolution">—</dd>
+        </dl>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
