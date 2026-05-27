@@ -63,6 +63,47 @@
       #hud dd { margin: 0; font-variant-numeric: tabular-nums; }
       #hud .ok { color: #6dd58c; }
       #hud .warn { color: var(--hud-warn); }
+
+      /* 迭代 3：工具栏 */
+      #toolbar {
+        position: absolute;
+        bottom: 18px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 6px;
+        padding: 6px;
+        background: rgba(15, 18, 24, 0.85);
+        border-radius: 10px;
+        backdrop-filter: blur(6px);
+        z-index: 10;
+      }
+      .tool-btn {
+        appearance: none;
+        border: 1px solid #2a2f38;
+        background: #1b1f27;
+        color: #d4d8de;
+        font: 12px/1.2 inherit;
+        padding: 8px 14px;
+        border-radius: 6px;
+        cursor: pointer;
+        min-width: 76px;
+        text-align: center;
+        transition: background 0.12s, color 0.12s, border-color 0.12s;
+      }
+      .tool-btn:hover { background: #232830; }
+      .tool-btn.active {
+        background: #2c5d8a;
+        border-color: #4d8cc4;
+        color: #ffffff;
+      }
+      .tool-btn .hint {
+        display: block;
+        font-size: 10px;
+        color: #8a909a;
+        margin-top: 2px;
+      }
+      .tool-btn.active .hint { color: #cfe1f5; }
     </style>
   </head>
   <body>
@@ -81,6 +122,11 @@
           <dt>Renderer</dt><dd id="hud-renderer">—</dd>
           <dt>Resolution</dt><dd id="hud-resolution">—</dd>
         </dl>
+      </div>
+      <div id="toolbar">
+        <button class="tool-btn active" data-tool="select">选择<span class="hint">V</span></button>
+        <button class="tool-btn" data-tool="road">铺路<span class="hint">R</span></button>
+        <button class="tool-btn" data-tool="bulldoze">拆除<span class="hint">X</span></button>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

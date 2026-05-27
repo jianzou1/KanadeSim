@@ -1,13 +1,16 @@
 /**
- * 道路拥堵热力图（C3 · design.md §8 档 1）
+ * 道路拥堵热力图（E1 · 支持 per-edge / per-parent 双模式）
  *
  * 思路：
- *   - 给每段路一个独立的 PlaneGeometry mesh，颜色由 congestion 决定
- *   - 平铺在原沥青上方 0.005 处（z-fight 安全余量）
- *   - 拥堵度 0→1 渐变：绿（0）→ 黄（0.5）→ 红（1）
- *   - 用 Mesh + MeshBasicMaterial（自发光，不受光照影响，颜色稳定）
+ *   - 仍是每段路一个独立 Mesh（C3 一致）
+ *   - 但 region 列表现在可以是"父路 4 条"或"子边 12 条"
+ *   - 颜色由 congestion 决定：绿（0）→ 黄（0.5）→ 红（1）
  *
- * 数据来源：SimSnapshot.roads（[flow, congestion] × N），主线程每帧读最新一份
+ * 数据来源：
+ *   - 父路模式：SimSnapshot.roads 仍是 [flow, cong] × 4
+ *   - 子边模式：SimSnapshot.edges 是 [flow, cong] × N（E1 新增）
+ *
+ * 渲染层不感知图结构，只接受 region 矩形 + 一个匹配的数据流。
  */
 
 import * as THREE from 'three';
@@ -25,7 +28,6 @@ function lerpColor(out: THREE.Color, a: THREE.Color, b: THREE.Color, t: number):
 }
 
 function congestionToColor(c: number, out: THREE.Color): void {
-  // 0~0.5 绿→黄；0.5~1 黄→红
   if (c <= 0.5) {
     lerpColor(out, COLOR_LO, COLOR_MD, c / 0.5);
   } else {
@@ -47,8 +49,21 @@ export class RoadHeatmap {
 
   constructor(regions: RoadVisualRegion[]) {
     this.group = new THREE.Group();
+    this.rebuild(regions);
+  }
+
+  /** 在初始化或拓扑变化后重建 mesh 列表。 */
+  rebuild(regions: RoadVisualRegion[]): void {
+    // 清掉旧 mesh
+    for (const m of this.meshes) {
+      this.group.remove(m);
+      (m.geometry as THREE.BufferGeometry).dispose();
+    }
+    for (const mat of this.materials) mat.dispose();
+    this.meshes.length = 0;
+    this.materials.length = 0;
+
     for (const r of regions) {
-      // 半透明叠色到沥青上，保留原沥青纹理可读性
       const mat = new THREE.MeshBasicMaterial({
         color: COLOR_LO,
         transparent: true,
@@ -57,21 +72,20 @@ export class RoadHeatmap {
       });
       const mesh = new THREE.Mesh(new THREE.PlaneGeometry(r.w, r.d), mat);
       mesh.rotation.x = -Math.PI / 2;
-      mesh.position.set(r.x + r.w / 2, 0.025, r.z + r.d / 2);  // 在道路（0.01）上方一点
+      mesh.position.set(r.x + r.w / 2, 0.025, r.z + r.d / 2);
       this.group.add(mesh);
       this.meshes.push(mesh);
       this.materials.push(mat);
     }
   }
 
-  /** roadsPacked = [flow0, cong0, flow1, cong1, ...] */
-  apply(roadsPacked: Float32Array): void {
-    const n = Math.min(this.materials.length, roadsPacked.length >> 1);
+  /** packed = [flow0, cong0, flow1, cong1, ...] */
+  apply(packed: Float32Array): void {
+    const n = Math.min(this.materials.length, packed.length >> 1);
     for (let r = 0; r < n; r++) {
-      const cong = roadsPacked[r * 2 + 1];
+      const cong = packed[r * 2 + 1];
       congestionToColor(cong, TMP);
       this.materials[r].color.copy(TMP);
-      // 拥堵高的路也更醒目（不透明度小幅增加）
       this.materials[r].opacity = 0.45 + cong * 0.35;
     }
   }

@@ -66,9 +66,28 @@ export class BuildingStore {
 
   count = 0;
 
-  spawn(x: number, z: number, w: number, d: number, h: number, use: BuildingUse): number {
-    if (this.count >= MAX_BUILDINGS) return -1;
-    const i = this.count++;
+  /** 已"销毁"标记（迭代 3 起，建筑可被自生长系统删除）。 */
+  readonly alive = new Uint8Array(MAX_BUILDINGS);
+  /** 出生 tick（用于动画 / 升级判定）。 */
+  readonly bornTick = new Int32Array(MAX_BUILDINGS);
+  /** 单调递增 ID（供主线程在快照中识别"哪栋是新增的"，与 idx 无关）。 */
+  readonly uid = new Int32Array(MAX_BUILDINGS);
+  private nextUid = 1;
+
+  /**
+   * 空闲 idx 池：被 destroy 的索引会被重用，避免 count 无限增长。
+   * 简单栈实现，spike 阶段够用。
+   */
+  private freeList: number[] = [];
+
+  spawn(x: number, z: number, w: number, d: number, h: number, use: BuildingUse, tick = 0): number {
+    let i: number;
+    if (this.freeList.length > 0) {
+      i = this.freeList.pop()!;
+    } else {
+      if (this.count >= MAX_BUILDINGS) return -1;
+      i = this.count++;
+    }
     this.x[i] = x;
     this.z[i] = z;
     this.w[i] = w;
@@ -80,7 +99,22 @@ export class BuildingStore {
     this.demand[i] = 0;
     this.satisfaction[i] = 0.5;     // 初始中性
     this.tax[i] = 0;
+    this.alive[i] = 1;
+    this.bornTick[i] = tick;
+    this.uid[i] = this.nextUid++;
     return i;
+  }
+
+  /** 销毁建筑（迭代 3 起）。idx 进入 freeList 等待复用。 */
+  destroy(i: number): void {
+    if (i < 0 || i >= this.count || !this.alive[i]) return;
+    this.alive[i] = 0;
+    this.population[i] = 0;
+    this.capacity[i] = 0;
+    this.tax[i] = 0;
+    this.satisfaction[i] = 0;
+    this.uid[i] = 0;
+    this.freeList.push(i);
   }
 
   reset(): void {
@@ -89,5 +123,10 @@ export class BuildingStore {
     this.demand.fill(0);
     this.satisfaction.fill(0);
     this.tax.fill(0);
+    this.alive.fill(0);
+    this.bornTick.fill(0);
+    this.uid.fill(0);
+    this.freeList.length = 0;
+    this.nextUid = 1;
   }
 }

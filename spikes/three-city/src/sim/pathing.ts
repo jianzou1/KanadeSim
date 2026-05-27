@@ -1,121 +1,143 @@
 /**
- * 最小可行路径规划（C3.2 · 严格沿道路网移动）
+ * 路径规划（E2 · 基于 RoadGraph 的 Dijkstra + 缓存）
  *
- * 设计：
- *   - 道路 = 井字 4 段路（2 NS + 2 EW）
- *   - 代理走 5 个航点：[home, upRoad, corner, downRoad, work]
- *   - 关键约束：所有从 access 起 → 到 access 终之间的航点必须落在路网交叉点上
- *     这样代理只在道路网上"L 形"行进，不会横穿别人街区
+ * 设计要点：
+ *   - planTrip(srcX, srcZ, dstX, dstZ, ctx) → TripPlan
+ *       - entry: home 最近的 RoadNode 坐标（车辆"上路点"）
+ *       - exit:  work 最近的 RoadNode 坐标（车辆"下路点"）
+ *       - edges: entry → exit 的 RoadEdge id 序列（按 time+comfort 成本最短）
+ *   - 路径缓存 key = (entryNodeId, exitNodeId)；图拓扑变就 invalidate（外部调 invalidate()）
+ *   - 同 OD 复用：同一对 home/work 的多个代理共享一份 plan
+ *   - 寻路队列限频：每帧最多 N 个新请求，超出排到下一帧
  *
- * 与 v1 的区别：
- *   - corner 是 NS×EW 真正交叉口（之前可能是非道路点）
- *   - access 选择更稳定：先决定"先走 NS 还是先走 EW"，对应 corner 落点
- *
- * 等 C1 + MVP 引入真道路图后，整体替换成 A* on graph。
+ * 与 C3 旧 planPath 的区别：
+ *   - 不再返回扁平航点数组；改为 TripPlan 结构
+ *   - 不再做"靠右车道偏移"——E2 视觉先回到"沿 edge 中线"，等 E3 再补
+ *   - 兼容外层调用：导出 LaneMode 占位（暂时无用）
  */
 
+import { RoadGraph, type EdgeCostFn, makeTimeCost } from './roadGraph';
+
 export interface PathContext {
-  /** 南北路 x 中心坐标列表 */
+  /** 路网图。 */
+  graph: RoadGraph;
+  /** 兼容字段（C3 旧代码引用），E2 之后逐步弃用。 */
   nsRoadCenters: number[];
-  /** 东西路 z 中心坐标列表 */
   ewRoadCenters: number[];
 }
 
-/** 找数组里离 v 最近的元素的索引。 */
-function nearestIndex(arr: number[], v: number): number {
-  let bi = 0;
-  let bd = Math.abs(arr[0] - v);
-  for (let i = 1; i < arr.length; i++) {
-    const d = Math.abs(arr[i] - v);
-    if (d < bd) { bd = d; bi = i; }
-  }
-  return bi;
+export const enum LaneMode {
+  Driver = 0,
+  Walker = 1,
 }
 
-/**
- * 给一个起终点，返回 5 个航点：[起点, 上路点, 交叉口, 下路点, 终点]
- * 所有中间航点都在道路网上。
- *
- * @param sideOffset 步行专用：航点横向偏移路中心多少（让步行走人行道而非路中央）。
- *                   driver 传 0；walker 通常传 ±0.7（路宽 2 的两侧人行道）。
- *                   正负随机化交给调用方，这里只按符号决定方向。
- */
-export function planPath(
-  sx: number, sz: number,
-  tx: number, tz: number,
-  ctx: PathContext,
-  sideOffset = 0,
-): number[] {
-  const ns = ctx.nsRoadCenters;
-  const ew = ctx.ewRoadCenters;
+export interface TripPlan {
+  entryX: number;
+  entryZ: number;
+  exitX: number;
+  exitZ: number;
+  /** edge id 序列；空数组 = 起终点共享同一最近 node，无需上路。 */
+  edges: number[];
+  /** Dijkstra 估算的成本（time + comfort），tick 用来做"路径成本超阈值"重规划判断。 */
+  cost: number;
+  /** 估算的"自由流通勤"长度（用于 E3 起步）。 */
+  totalLength: number;
+}
 
-  // 起点：选离 home 最近的 NS 路 x 或 EW 路 z 作为"上路边"
-  // 规则：先走出街区到主路 → 在 NS 上还是 EW 上，看哪个更近
-  const sNsIdx = nearestIndex(ns, sx);
-  const sEwIdx = nearestIndex(ew, sz);
-  const dNsS = Math.abs(ns[sNsIdx] - sx);
-  const dEwS = Math.abs(ew[sEwIdx] - sz);
+/** Pathing 系统：包含缓存与限流。 */
+export class PathingSystem {
+  private cache = new Map<number, TripPlan>();
+  private costFn: EdgeCostFn = makeTimeCost(0.5);
+  /** 缓存使能开关（debug：关掉证明缓存仅是优化）。 */
+  private cacheEnabled = true;
+  /** 每 tick 允许新规划的最大次数（限流）。 */
+  private maxPlansPerTick = 64;
+  private plansThisTick = 0;
+  /** 失败查询计数（debug 用）。 */
+  hitCount = 0;
+  missCount = 0;
+  rejectCount = 0;
 
-  // 终点：同样选最近的路
-  const tNsIdx = nearestIndex(ns, tx);
-  const tEwIdx = nearestIndex(ew, tz);
-  const dNsT = Math.abs(ns[tNsIdx] - tx);
-  const dEwT = Math.abs(ew[tEwIdx] - tz);
+  setCostFn(fn: EdgeCostFn): void { this.costFn = fn; this.invalidate(); }
+  setCacheEnabled(v: boolean): void { this.cacheEnabled = v; if (!v) this.cache.clear(); }
+  setMaxPlansPerTick(n: number): void { this.maxPlansPerTick = n; }
 
-  // 起点上路点 + 终点下路点
-  const startsOnNS = dNsS <= dEwS;
-  const endsOnNS = dNsT <= dEwT;
+  /** 帧开始时调一次。 */
+  beginTick(): void { this.plansThisTick = 0; }
 
-  // 步行偏移：走 NS 路时沿 x 偏移、走 EW 路时沿 z 偏移
-  // 偏移方向：以"起点应该走哪一侧"决定。简单规则：home 在路的左侧 → 走左人行道
-  const startNsX = ns[sNsIdx];
-  const startEwZ = ew[sEwIdx];
-  const startSideNs = sideOffset === 0 ? 0 : (sx < startNsX ? -sideOffset : sideOffset);
-  const startSideEw = sideOffset === 0 ? 0 : (sz < startEwZ ? -sideOffset : sideOffset);
+  /** 拓扑或成本权重显著变化时（E3 拥堵刷新）调用。 */
+  invalidate(): void { this.cache.clear(); }
 
-  const endNsX = ns[tNsIdx];
-  const endEwZ = ew[tEwIdx];
-  const endSideNs = sideOffset === 0 ? 0 : (tx < endNsX ? -sideOffset : sideOffset);
-  const endSideEw = sideOffset === 0 ? 0 : (tz < endEwZ ? -sideOffset : sideOffset);
-
-  const upRoad = startsOnNS
-    ? { x: startNsX + startSideNs, z: sz }
-    : { x: sx, z: startEwZ + startSideEw };
-
-  const downRoad = endsOnNS
-    ? { x: endNsX + endSideNs, z: tz }
-    : { x: tx, z: endEwZ + endSideEw };
-
-  // 交叉口：保证转角点也在"同一侧人行道"，而不是路中心
-  let corner: { x: number; z: number };
-  if (startsOnNS && endsOnNS) {
-    // 起终都在 NS 路上：corner 沿 upRoad 同 NS 路，z 取终点 EW 路 + 终点侧偏
-    corner = {
-      x: startNsX + startSideNs,
-      z: ew[tEwIdx] + endSideEw,
-    };
-  } else if (!startsOnNS && !endsOnNS) {
-    corner = {
-      x: ns[tNsIdx] + endSideNs,
-      z: startEwZ + startSideEw,
-    };
-  } else if (startsOnNS && !endsOnNS) {
-    corner = {
-      x: startNsX + startSideNs,
-      z: ew[tEwIdx] + endSideEw,
-    };
-  } else {
-    corner = {
-      x: ns[tNsIdx] + endSideNs,
-      z: startEwZ + startSideEw,
-    };
+  /** 缓存键：低位 entryNodeId、高位 exitNodeId（spike 阶段 12 nodes，安全）。 */
+  private cacheKey(entry: number, exit: number): number {
+    return (exit << 16) | (entry & 0xFFFF);
   }
 
-  return [
-    sx, sz,                  // wp0: 起点（家或公司精确位置）
-    upRoad.x, upRoad.z,      // wp1: 走出街区到路边
-    corner.x, corner.z,      // wp2: 路网交叉口
-    downRoad.x, downRoad.z,  // wp3: 终点对应路边
-    tx, tz,                  // wp4: 终点
-  ];
+  /**
+   * 规划一次 trip。返回 null 表示被限流（调用方应保留旧路径下一帧再来）。
+   * @param force 跳过限流（用于"必须立刻有路"的初始化）
+   */
+  planTrip(srcX: number, srcZ: number, dstX: number, dstZ: number, ctx: PathContext, force = false): TripPlan | null {
+    const g = ctx.graph;
+    const entryNode = g.nearestNode(srcX, srcZ);
+    const exitNode = g.nearestNode(dstX, dstZ);
+
+    // 起终点同一最近 node：直接走 walk 段（边数 0）
+    if (entryNode.id === exitNode.id) {
+      return {
+        entryX: entryNode.x, entryZ: entryNode.z,
+        exitX: exitNode.x, exitZ: exitNode.z,
+        edges: [],
+        cost: 0,
+        totalLength: 0,
+      };
+    }
+
+    if (this.cacheEnabled) {
+      const k = this.cacheKey(entryNode.id, exitNode.id);
+      const cached = this.cache.get(k);
+      if (cached) { this.hitCount++; return cached; }
+    }
+    this.missCount++;
+
+    // 限流：超额时返回 null（调用方决定如何 fallback）
+    if (!force && this.plansThisTick >= this.maxPlansPerTick) {
+      this.rejectCount++;
+      return null;
+    }
+    this.plansThisTick++;
+
+    const path = g.fastestPath(entryNode.id, exitNode.id, this.costFn);
+    if (!path) return null;
+
+    let cost = 0;
+    let len = 0;
+    let prev = null as null | (typeof path)[number];
+    const ids: number[] = [];
+    for (const e of path) {
+      cost += this.costFn(e, prev);
+      len += e.length;
+      ids.push(e.id);
+      prev = e;
+    }
+    const plan: TripPlan = {
+      entryX: entryNode.x, entryZ: entryNode.z,
+      exitX: exitNode.x, exitZ: exitNode.z,
+      edges: ids,
+      cost,
+      totalLength: len,
+    };
+    if (this.cacheEnabled) {
+      this.cache.set(this.cacheKey(entryNode.id, exitNode.id), plan);
+    }
+    return plan;
+  }
+
+  /** 给 E3 用：当某 OD 的现成路径成本飙升时强制 invalidate 这一对。 */
+  invalidatePair(entryNodeId: number, exitNodeId: number): void {
+    this.cache.delete(this.cacheKey(entryNodeId, exitNodeId));
+  }
 }
+
+/** 单例（worker 内独占）。 */
+export const pathing = new PathingSystem();

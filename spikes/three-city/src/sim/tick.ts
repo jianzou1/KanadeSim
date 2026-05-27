@@ -1,159 +1,294 @@
 /**
- * 单 tick 模拟逻辑（C3.1 · 沿道路移动）
+ * 单 tick 模拟逻辑（迭代 2 · E2 · 沿 RoadGraph edge 推进）
  *
- * 改进自 B1 的直线移动：现在代理走 5 个航点
- *   home → 上路点 → 转折点 → 下路点 → work
- * 每到一个航点就切下一个；走完 wp 序列就到达目的地。
+ * 三段式 trip：
+ *   WalkIn   home → entry node（直线）
+ *   Cruise   按 edgeSeq 推进 tOnEdge ∈ [0, 1]，跨 edge 自动切下一个
+ *   WalkOut  exit node → work（直线）
  *
- * 这样代理会聚集在 4 段井字路上，热力图和拥堵着色才有意义。
- *
- * C 阶段不做：
- *   - 真正的 A* 寻路（design.md §7 阶段 2/3，留到 MVP）
- *   - 拥堵反馈到速度（design.md §8 档 2）
+ * 设计原则（沿用 C3.5）：
+ *   - trip 一旦发起就走到底；只有静止态（AtHome / Working）才响应 phase 切换
+ *   - 拥堵反馈进 edge 速度：v = edge.speed × (1 - α × congestion)
  */
 
-import { AgentState, AgentKind, TICK_MS, TICKS_PER_DAY } from './types';
-import type { AgentStore } from './agents';
-import { planPath, type PathContext } from './pathing';
-import type { TrafficStore } from './traffic';
+import { AgentState, AgentKind, TICK_MS } from './types';
+import { TripPhase, type AgentStore } from './agents';
+import { pathing, type PathContext } from './pathing';
+import type { RoadGraph } from './roadGraph';
+import { Phase, getPhase, hourOfDay, tickToClock as clockTickToClock } from './clock';
+import { laneOffset } from './laneOffset';
 
 const DT = TICK_MS / 1000;
-const SPEED_WALK = 1.6;        // tile/秒（步行）
-const SPEED_DRIVE = 4.5;       // tile/秒（车，约 2.8 倍步行）
+const SPEED_WALK = 1.6;
+const SPEED_DRIVE = 4.5;
 const ARRIVE_EPS = 0.04;
-const CONGESTION_SPEED_PENALTY = 0.7;  // 拥堵 1.0 时车速衰减到 30%
+const CONGESTION_SPEED_PENALTY = 0.7;
 
-const enum Phase {
-  Night = 0,    // 20:00 – 06:00（在家睡觉）
-  Morning = 1,  // 06:00 – 09:00（早高峰：去上班）
-  Day = 2,      // 09:00 – 17:00（在公司工作）
-  Evening = 3,  // 17:00 – 20:00（晚高峰：回家）
-}
+/** 兼容旧 import：导出给外部用。 */
+export const tickToClock = clockTickToClock;
 
-function getPhase(tick: number): Phase {
-  // tick 时间 → [0, 1) 的"小时进度"
-  const hourProgress = (tick % TICKS_PER_DAY) / TICKS_PER_DAY;
-  // 24 小时映射
-  const hour = hourProgress * 24;
-  if (hour >= 6 && hour < 9) return Phase.Morning;
-  if (hour >= 9 && hour < 17) return Phase.Day;
-  if (hour >= 17 && hour < 20) return Phase.Evening;
-  return Phase.Night;
-}
-
-/**
- * 取当前模拟时刻（HH:MM 字符串），主线程 HUD 用。
- * 不依赖 AgentStore，导出给 worker 直接调。
- */
-export function tickToClock(tick: number): { hour: number; minute: number } {
-  const hourProgress = (tick % TICKS_PER_DAY) / TICKS_PER_DAY;
-  const totalMinutes = Math.floor(hourProgress * 24 * 60);
-  return { hour: Math.floor(totalMinutes / 60), minute: totalMinutes % 60 };
-}
-
-/**
- * 给一个代理设置"从 a → b 沿路"的航点序列。
- */
+/** 给一个代理派发一次 trip。 */
 function dispatchTrip(
   store: AgentStore,
   i: number,
   sx: number, sz: number,
   tx: number, tz: number,
   ctx: PathContext,
+  tick: number,
 ): void {
-  // 步行走人行道（侧偏 0.7），驾车走路中央（侧偏 0）
-  const side = store.kind[i] === AgentKind.Driver ? 0 : 0.7;
-  const pts = planPath(sx, sz, tx, tz, ctx, side);
-  store.setWaypoints(i, pts);
-  // 第 0 个航点 = 起点 = 当前位置；从 wp1 开始追
-  store.wpIdx[i] = 1;
-  // targetX/Z 指向当前 wp
-  const wp = store.getWaypoint(i, 1);
-  store.targetX[i] = wp.x;
-  store.targetZ[i] = wp.z;
+  const plan = pathing.planTrip(sx, sz, tx, tz, ctx, /*force=*/false);
+  if (!plan) {
+    // 被限流：直接退回 walk 模式（直线奔目标）
+    const wb = i;
+    store.edgeCount[wb] = 0;
+    store.tripPhase[wb] = TripPhase.WalkOut;
+    store.targetX[wb] = tx;
+    store.targetZ[wb] = tz;
+    store.tripStartTick[i] = tick;
+    return;
+  }
+  store.setEdgeTrip(i, plan.edges, { x: plan.entryX, z: plan.entryZ }, { x: tx, z: tz });
+  store.tripStartTick[i] = tick;
+  store.lastReplanTick[i] = tick;
+
+  // 把 WalkIn 的 target 从"node 中心"修正到"第一条 edge 上的车道/人行道入口点"
+  // 这样 home → 入口点是顺滑斜线，Cruise 一开始就贴着车道，不会有"先到中线再侧移"的折角
+  if (plan.edges.length > 0) {
+    const isDriver = store.kind[i] === AgentKind.Driver;
+    const firstEdge = ctx.graph.edges[plan.edges[0]];
+    const entryNodeId = ctx.graph.nearestNode(plan.entryX, plan.entryZ).id;
+    const dirAtoB = firstEdge.from === entryNodeId ? 1 : 0;
+    const off = laneOffset(firstEdge, ctx.graph, dirAtoB, isDriver);
+    store.targetX[i] = plan.entryX + off.dx;
+    store.targetZ[i] = plan.entryZ + off.dz;
+  }
 }
 
-/** 单 tick：推进所有代理（沿航点）。 */
+/** Cruise 阶段每 tick 推进 tOnEdge。 */
+function advanceCruise(
+  store: AgentStore,
+  i: number,
+  graph: RoadGraph,
+  isDriver: boolean,
+): boolean {
+  // 返回 false 表示 Cruise 结束（可切到 WalkOut）
+  if (store.edgeCount[i] === 0) return false;
+  let eid = store.getEdgeId(i, store.edgeIdx[i]);
+  if (eid < 0) return false;
+  let edge = graph.edges[eid];
+
+  // 计算速度（拥堵衰减 + walker/driver 区分）
+  const baseSpeed = isDriver ? SPEED_DRIVE : SPEED_WALK;
+  const speed = isDriver
+    ? baseSpeed * (1 - CONGESTION_SPEED_PENALTY * edge.congestion)
+    : baseSpeed;     // walker 不受车流拥堵影响
+  // 本 tick 实际能走的"世界距离"
+  const distThisTick = speed * DT;
+
+  // 推进
+  let t = store.tOnEdge[i] + distThisTick / Math.max(0.001, edge.length);
+
+  // 跨 edge：循环里要同步更新 edge / eid，否则 arriveNode、长度都会用旧值，
+  // 在井字交叉口处反复横跳。
+  while (t >= 1.0) {
+    const overshootDist = (t - 1.0) * edge.length;     // 用"距离"做载体，长度变化天然对齐
+    const nextIdx = store.edgeIdx[i] + 1;
+    if (nextIdx >= store.edgeCount[i]) {
+      // 走完最后一段，落到 to 端 + 车道偏移
+      const aToB = store.edgeDirAtoB[i] === 1;
+      const fromN = aToB ? graph.nodes[edge.from] : graph.nodes[edge.to];
+      const toN = aToB ? graph.nodes[edge.to] : graph.nodes[edge.from];
+      const off = laneOffset(edge, graph, store.edgeDirAtoB[i], isDriver);
+      store.x[i] = toN.x + off.dx;
+      store.z[i] = toN.z + off.dz;
+      const dx = toN.x - fromN.x;
+      const dz = toN.z - fromN.z;
+      const d = Math.hypot(dx, dz) || 1;
+      store.vx[i] = (dx / d) * speed;
+      store.vz[i] = (dz / d) * speed;
+      store.tOnEdge[i] = 1;
+      return false;     // Cruise 结束
+    }
+    // 切到下一 edge：决定方向（共享 node 在哪一端）
+    const nextEid = store.getEdgeId(i, nextIdx);
+    const nextEdge = graph.edges[nextEid];
+    // 当前 edge 的"到达 node" = 朝 from→to 是 edge.to，反向是 edge.from
+    const arriveNode = store.edgeDirAtoB[i] === 1 ? edge.to : edge.from;
+    if (nextEdge.from === arriveNode) {
+      store.edgeDirAtoB[i] = 1;
+    } else if (nextEdge.to === arriveNode) {
+      store.edgeDirAtoB[i] = 0;
+    } else {
+      // 拓扑异常（不该发生）：保持原方向
+      store.edgeDirAtoB[i] = 1;
+    }
+    store.edgeIdx[i] = nextIdx;
+    // 关键：把 edge / eid 切到下一段，下次循环 / 投影才会用正确的几何
+    eid = nextEid;
+    edge = nextEdge;
+    // overshoot 距离 → 新 edge 的 t
+    t = overshootDist / Math.max(0.001, edge.length);
+    if (!isFinite(t) || t < 0) t = 0;
+  }
+  store.tOnEdge[i] = t;
+
+  // 投影位置：lerp(from, to) + 车道/人行道偏移（用循环结束后的 edge）
+  const aToB2 = store.edgeDirAtoB[i] === 1;
+  const aN = aToB2 ? graph.nodes[edge.from] : graph.nodes[edge.to];
+  const bN = aToB2 ? graph.nodes[edge.to] : graph.nodes[edge.from];
+  const tt = store.tOnEdge[i];
+  const off = laneOffset(edge, graph, store.edgeDirAtoB[i], isDriver);
+  const newX = aN.x + (bN.x - aN.x) * tt + off.dx;
+  const newZ = aN.z + (bN.z - aN.z) * tt + off.dz;
+  store.vx[i] = (newX - store.x[i]) / DT;
+  store.vz[i] = (newZ - store.z[i]) / DT;
+  store.x[i] = newX;
+  store.z[i] = newZ;
+  return true;
+}
+
+/** 单 tick：推进所有代理。 */
 export function stepTick(
   store: AgentStore,
   tick: number,
   ctx: PathContext,
-  traffic: TrafficStore | null = null,
+  onArriveWork?: (tripTicks: number) => void,
 ): void {
+  pathing.beginTick();
   const phase = getPhase(tick);
+  const hour = hourOfDay(tick);
+  const graph = ctx.graph;
   const {
     x, z, vx, vz,
     targetX, targetZ,
     state, kind,
     homeX, homeZ, workX, workZ,
-    wpIdx, wpCount,
+    tripPhase,
     count,
   } = store;
 
   for (let i = 0; i < count; i++) {
-    // --- 状态切换：触发新的航点序列 ---------------------------------------
-    if (phase === Phase.Morning && state[i] === AgentState.AtHome) {
+    // --- 状态切换 ---------------------------------------------------------
+    // E4：个人化离家/下班时刻，避免所有人在同一秒触发 dispatchTrip 造成画面瞬移
+    if (phase === Phase.Morning && state[i] === AgentState.AtHome && hour >= store.leaveHomeHour[i]) {
       state[i] = AgentState.GoingToWork;
-      dispatchTrip(store, i, x[i], z[i], workX[i], workZ[i], ctx);
-    } else if (phase === Phase.Evening &&
-               (state[i] === AgentState.Working || state[i] === AgentState.GoingToWork)) {
+      dispatchTrip(store, i, x[i], z[i], workX[i], workZ[i], ctx, tick);
+    } else if (phase === Phase.Evening && state[i] === AgentState.Working && hour >= store.leaveWorkHour[i]) {
       state[i] = AgentState.GoingHome;
-      dispatchTrip(store, i, x[i], z[i], homeX[i], homeZ[i], ctx);
+      dispatchTrip(store, i, x[i], z[i], homeX[i], homeZ[i], ctx, tick);
     }
 
-    // --- 沿航点移动 ---------------------------------------------------------
     if (state[i] !== AgentState.GoingToWork && state[i] !== AgentState.GoingHome) continue;
 
-    const dx = targetX[i] - x[i];
-    const dz = targetZ[i] - z[i];
-    const distSq = dx * dx + dz * dz;
+    const isDriver = kind[i] === AgentKind.Driver;
 
-    if (distSq < ARRIVE_EPS) {
-      // 到达当前航点，切下一个
-      const next = wpIdx[i] + 1;
-      if (next < wpCount[i]) {
-        wpIdx[i] = next;
-        const wp = store.getWaypoint(i, next);
-        targetX[i] = wp.x;
-        targetZ[i] = wp.z;
-      } else {
-        // 走完了 → 到达目的地
-        if (state[i] === AgentState.GoingToWork) state[i] = AgentState.Working;
-        else if (state[i] === AgentState.GoingHome) state[i] = AgentState.AtHome;
+    // --- 三段式推进 -------------------------------------------------------
+    if (tripPhase[i] === TripPhase.WalkIn) {
+      // 朝 entry（targetX/Z）走
+      const dx = targetX[i] - x[i];
+      const dz = targetZ[i] - z[i];
+      const distSq = dx * dx + dz * dz;
+      if (distSq < ARRIVE_EPS) {
+        // 进入 Cruise
+        if (store.edgeCount[i] > 0) {
+          tripPhase[i] = TripPhase.Cruise;
+          // 把当前位置 snap 到 entry 节点 + 车道偏移
+          const firstEid = store.getEdgeId(i, 0);
+          const firstEdge = graph.edges[firstEid];
+          // 决定方向：当前位置最近 node 是 from 还是 to（用偏移前的 entry 坐标判断）
+          const entryNode = graph.nearestNode(x[i], z[i]);
+          if (firstEdge.from === entryNode.id) store.edgeDirAtoB[i] = 1;
+          else if (firstEdge.to === entryNode.id) store.edgeDirAtoB[i] = 0;
+          else store.edgeDirAtoB[i] = 1;
+          store.tOnEdge[i] = 0;
+          // snap 到"node 中心 + 车道偏移"，与 advanceCruise 的投影口径一致
+          const off = laneOffset(firstEdge, graph, store.edgeDirAtoB[i], isDriver);
+          x[i] = entryNode.x + off.dx;
+          z[i] = entryNode.z + off.dz;
+        } else {
+          // 没有 edge → 直接 WalkOut（同一最近 node 的退化情形）
+          tripPhase[i] = TripPhase.WalkOut;
+          // exit 位置在 wp1（同时也是 work，已在 dispatch 时写入 targetX/Z 兜底）
+          const exit = store.getWaypoint(i, 1);
+          targetX[i] = exit.x;
+          targetZ[i] = exit.z;
+        }
+        continue;
+      }
+      const speed = isDriver ? SPEED_DRIVE : SPEED_WALK;
+      const d = Math.sqrt(distSq);
+      const stepDist = speed * DT;
+      // 一帧能跨过 entry：直接 snap，不冲过头
+      if (stepDist >= d) {
+        x[i] = targetX[i];
+        z[i] = targetZ[i];
         vx[i] = 0;
         vz[i] = 0;
+        continue;
+      }
+      vx[i] = (dx / d) * speed;
+      vz[i] = (dz / d) * speed;
+      x[i] += vx[i] * DT;
+      z[i] += vz[i] * DT;
+      continue;
+    }
+
+    if (tripPhase[i] === TripPhase.Cruise) {
+      const stillCruising = advanceCruise(store, i, graph, isDriver);
+      if (!stillCruising) {
+        // 切 WalkOut
+        tripPhase[i] = TripPhase.WalkOut;
+        // exit 节点已经是当前位置；目标改为 work / home（dispatchTrip 已写入 wp1）
+        const exit = store.getWaypoint(i, 1);
+        targetX[i] = exit.x;
+        targetZ[i] = exit.z;
       }
       continue;
     }
 
-    // --- 速度计算 -----------------------------------------------------------
-    const baseSpeed = kind[i] === AgentKind.Driver ? SPEED_DRIVE : SPEED_WALK;
-    let speed = baseSpeed;
-
-    // 仅对 driver 应用路段拥堵衰减；walker 视作"人行道"不堵
-    if (traffic && kind[i] === AgentKind.Driver) {
-      const cong = roadCongestionAt(x[i], z[i], traffic);
-      if (cong > 0) {
-        speed = baseSpeed * (1 - cong * CONGESTION_SPEED_PENALTY);
+    // WalkOut: 朝 work / home 直线走
+    {
+      const dx = targetX[i] - x[i];
+      const dz = targetZ[i] - z[i];
+      const distSq = dx * dx + dz * dz;
+      if (distSq < ARRIVE_EPS) {
+        // 到达
+        if (state[i] === AgentState.GoingToWork) {
+          state[i] = AgentState.Working;
+          // E3：上报通勤时长
+          if (onArriveWork && store.tripStartTick[i] >= 0) {
+            const dur = tick - store.tripStartTick[i];
+            if (dur > 0) onArriveWork(dur);
+          }
+          store.tripStartTick[i] = -1;
+        } else if (state[i] === AgentState.GoingHome) {
+          state[i] = AgentState.AtHome;
+          store.tripStartTick[i] = -1;
+        }
+        // snap 位置到目标，避免下一帧再读到偏离值
+        x[i] = targetX[i];
+        z[i] = targetZ[i];
+        vx[i] = 0;
+        vz[i] = 0;
+        continue;
       }
+      const speed = isDriver ? SPEED_DRIVE : SPEED_WALK;
+      const d = Math.sqrt(distSq);
+      const stepDist = speed * DT;
+      // 关键：如果这一帧能跨过 target，直接 snap，不能"冲过头"再下一帧反弹
+      if (stepDist >= d) {
+        x[i] = targetX[i];
+        z[i] = targetZ[i];
+        vx[i] = 0;
+        vz[i] = 0;
+        // 不在这里切 state，让"距离 < ARRIVE_EPS" 的分支在下一帧统一处理；
+        // 这样到达动画 / commute 上报都走同一条路径。
+        continue;
+      }
+      vx[i] = (dx / d) * speed;
+      vz[i] = (dz / d) * speed;
+      x[i] += vx[i] * DT;
+      z[i] += vz[i] * DT;
     }
-
-    const d = Math.sqrt(distSq);
-    vx[i] = (dx / d) * speed;
-    vz[i] = (dz / d) * speed;
-    x[i] += vx[i] * DT;
-    z[i] += vz[i] * DT;
   }
-}
-
-/** 查找一个点落在哪段路上的拥堵度；不在路上则返回 0。 */
-function roadCongestionAt(px: number, pz: number, traffic: TrafficStore): number {
-  const regions = traffic.regions;
-  for (let r = 0; r < regions.length; r++) {
-    const reg = regions[r];
-    if (px >= reg.x && px < reg.x + reg.w && pz >= reg.z && pz < reg.z + reg.d) {
-      return traffic.congestion[r];
-    }
-  }
-  return 0;
 }

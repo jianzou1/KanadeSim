@@ -31,6 +31,13 @@ export class OrthoCityCamera {
   private dragging = false;
   private lastX = 0;
   private lastY = 0;
+  /** 迭代 3：当工具占用左键时（铺路 / 拆除），关闭相机的左键拖拽。 */
+  private leftButtonEnabled = true;
+
+  setLeftButtonEnabled(v: boolean): void {
+    this.leftButtonEnabled = v;
+    if (!v && this.dragging) this.dragging = false;
+  }
 
   constructor(opts: CameraOptions) {
     this.opts = opts;
@@ -67,6 +74,8 @@ export class OrthoCityCamera {
   }
 
   private onDown = (e: PointerEvent): void => {
+    // 左键被工具占用时不接管
+    if (e.button === 0 && !this.leftButtonEnabled) return;
     if (e.button !== 2 && e.button !== 0) return;
     this.dragging = true;
     this.lastX = e.clientX;

@@ -1,20 +1,18 @@
 /**
- * 道路流量统计（C3 · design.md §8 档 1）
+ * 道路流量统计（E1 · 升级为 RoadGraph 委托）
  *
- * 最小可行版：
- *   - 道路 = 矩形 region 列表（井字路 = 4 段）
- *   - 每 tick 扫描代理位置，落在哪段路就该段 flow++
- *   - 拥堵 = flow / capacity → 0-1 标准化
+ * 历史背景（C3）：原 TrafficStore 直接管 4 条路矩形 region 的 flow/congestion。
+ * E1 升级：内部改用 RoadGraph（per-edge 计数 + 父路聚合），对外接口保持兼容：
+ *   - 仍接受 RoadRegion[] 作初始化参数
+ *   - flow / congestion 暴露为"按父路聚合"的视图，给 HUD 4 条路视图用
+ *   - pack() 输出仍是父路口径的 [flow, cong] × N
  *
- * 这个模型够用的依据：
- *   - C3 阶段不做寻路（仍是 sim/tick.ts 的直线移动）
- *   - 玩家肉眼只需看"哪条路上的小方块密"
- *   - 等 C1 + MVP 加道路图后，把 RoadRegion[] 换成 edge 图即可，统计接口可保持
- *
- * 与渲染解耦：
- *   - sim 只产 flow / congestion 数字
- *   - render/roadHeatmap.ts 把数字着色到地面 InstancedMesh
+ * 新增能力（给 E2 / E3 用）：
+ *   - graph 属性：拿到完整 RoadGraph，做寻路 / per-edge 渲染
+ *   - packEdges()：per-edge 打包，给 RoadHeatmap 改造时用
  */
+
+import { RoadGraph } from './roadGraph';
 
 export interface RoadRegion {
   /** 矩形左下角 + 大小（tile 单位） */
@@ -26,68 +24,105 @@ export interface RoadRegion {
   capacity: number;
 }
 
-/**
- * 道路流量统计器
- * - flow[i]: 当前窗口内经过该段路的代理累计计数
- * - congestion[i]: 0-1，平滑后的拥堵度（用作着色）
- */
 export class TrafficStore {
+  /** 原始 region 列表（程序化生成的井字路 + 玩家追加的）。 */
   readonly regions: RoadRegion[];
-  readonly flow: Uint32Array;
-  readonly congestion: Float32Array;
+  readonly graph: RoadGraph;
 
-  // 平滑参数：congestion 跟踪 instantFlow/capacity 的 EMA
-  private static readonly EMA = 0.25;
+  /** 父路聚合的 flow（HUD 兼容）。每次 countAgents 后刷新。 */
+  flow: Uint32Array;
+  /** 父路聚合的 congestion（HUD 兼容）。 */
+  congestion: Float32Array;
 
-  constructor(regions: RoadRegion[]) {
-    this.regions = regions;
-    this.flow = new Uint32Array(regions.length);
-    this.congestion = new Float32Array(regions.length);
+  // 平滑参数（E3 会调到 0.15）
+  private static readonly DEFAULT_EMA = 0.25;
+
+  private gridSizeX: number;
+  private gridSizeZ: number;
+  /** 起始（程序化）region 数量，区分玩家追加段 */
+  readonly baseRegionCount: number;
+  /** 玩家段 id → 全局 region index 的映射（用于 removePlayerRoad） */
+  private playerRegionByGlobalId = new Map<number, number>();
+
+  constructor(regions: RoadRegion[], gridSizeX: number, gridSizeZ: number = gridSizeX) {
+    this.regions = regions.slice();
+    this.baseRegionCount = regions.length;
+    this.gridSizeX = gridSizeX;
+    this.gridSizeZ = gridSizeZ;
+    this.graph = new RoadGraph();
+    this.graph.setEma(TrafficStore.DEFAULT_EMA);
+    this.graph.buildFromRegions(this.regions, gridSizeX, gridSizeZ);
+    this.flow = new Uint32Array(this.regions.length);
+    this.congestion = new Float32Array(this.regions.length);
   }
 
-  /** 每 tick 开始时清零累计 flow（避免无限累积）。 */
+  /** 迭代 3 R4：增量加一段玩家铺的路。返回 region index。 */
+  addPlayerRoad(seg: { x: number; z: number; w: number; d: number; capacity: number }, playerId: number): number {
+    const idx = this.regions.length;
+    this.regions.push({ x: seg.x, z: seg.z, w: seg.w, d: seg.d, capacity: seg.capacity });
+    this.playerRegionByGlobalId.set(playerId, idx);
+    this.rebuild();
+    return idx;
+  }
+
+  /** 迭代 3 R4：删除玩家铺的某段路（用 RoadTool 端的 playerId）。 */
+  removePlayerRoad(playerId: number): boolean {
+    const idx = this.playerRegionByGlobalId.get(playerId);
+    if (idx === undefined) return false;
+    this.regions.splice(idx, 1);
+    this.playerRegionByGlobalId.delete(playerId);
+    // 删除后，所有 idx > 已删的 player 段需要把映射也减 1
+    for (const [pid, gi] of this.playerRegionByGlobalId) {
+      if (gi > idx) this.playerRegionByGlobalId.set(pid, gi - 1);
+    }
+    this.rebuild();
+    return true;
+  }
+
+  /** 重建 RoadGraph + 重置 flow/congestion 数组到新长度。 */
+  private rebuild(): void {
+    this.graph.buildFromRegions(this.regions, this.gridSizeX, this.gridSizeZ);
+    this.flow = new Uint32Array(this.regions.length);
+    this.congestion = new Float32Array(this.regions.length);
+  }
+
+  /** EMA 调参对外开放（E3 用）。 */
+  setEma(v: number): void { this.graph.setEma(v); }
+
+  /** 每 tick 开始时清零 flow（保留接口给 tick 流程兼容）。 */
   resetFlow(): void {
+    this.graph.resetFlow();
     this.flow.fill(0);
   }
 
   /**
-   * 扫描所有代理位置，更新各路段 flow。
-   * 调用方应在 stepTick 之后调用本方法，使用刚移动完的位置。
+   * 扫描所有代理位置，沿 edge 累计 flow，再聚合到父路给 HUD 用。
    */
   countAgents(agentX: Float32Array, agentZ: Float32Array, n: number): void {
-    this.resetFlow();
-    const regions = this.regions;
-    const flow = this.flow;
-    const len = regions.length;
-
-    for (let i = 0; i < n; i++) {
-      const x = agentX[i];
-      const z = agentZ[i];
-      for (let r = 0; r < len; r++) {
-        const reg = regions[r];
-        if (x >= reg.x && x < reg.x + reg.w && z >= reg.z && z < reg.z + reg.d) {
-          flow[r]++;
-          break;  // 一个代理最多算在一条路上（井字交叉处不重复计）
-        }
+    this.graph.countAgents(agentX, agentZ, n);
+    // 聚合到父路
+    const np = this.regions.length;
+    for (let p = 0; p < np; p++) {
+      let flow = 0;
+      let congMax = 0;
+      const eids = this.graph.edgesByParent[p] || [];
+      for (const id of eids) {
+        const e = this.graph.edges[id];
+        flow += e.flow;
+        if (e.congestion > congMax) congMax = e.congestion;
       }
-    }
-
-    // 更新平滑拥堵度
-    for (let r = 0; r < len; r++) {
-      const target = Math.min(1, flow[r] / regions[r].capacity);
-      this.congestion[r] = this.congestion[r] + (target - this.congestion[r]) * TrafficStore.EMA;
+      this.flow[p] = flow;
+      this.congestion[p] = congMax;
     }
   }
 
-  /** 把 flow/congestion 打包成扁平 Float32Array，跨线程传给主线程渲染。 */
+  /** 父路口径打包 [flow, cong] × regions.length（HUD 4 条路兼容）。 */
   pack(): Float32Array {
-    // 每段路 2 个 float：[flow, congestion]
-    const len = this.regions.length;
-    const out = new Float32Array(len * 2);
-    for (let r = 0; r < len; r++) {
-      out[r * 2] = this.flow[r];
-      out[r * 2 + 1] = this.congestion[r];
-    }
-    return out;
+    return this.graph.packParentRoads();
+  }
+
+  /** Per-edge 打包，给 RoadHeatmap 用（E1 后渲染层切换到这个口径）。 */
+  packEdges(): Float32Array {
+    return this.graph.packEdges();
   }
 }

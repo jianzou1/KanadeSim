@@ -12,12 +12,15 @@
  */
 
 import * as THREE from 'three';
-import { buildScene, GRID_SIZE, getRoadRegions } from './render/scene';
+import { buildScene, GRID_SIZE, GRID_W, GRID_D, getRoadRegions, getDistrictLayout } from './render/scene';
 import { OrthoCityCamera } from './render/camera';
 import { PixelPipeline } from './render/pixelPipeline';
 import { AgentInstances } from './render/agents';
+import { RoadTool, type Tool } from './render/roadTool';
 import { SimHandle } from './sim/simHandle';
 import { MAX_AGENTS } from './sim/types';
+import type { DistrictSnapshot, ChainSnapshotItem, LineSnapshotItem } from './sim/types';
+import { ROAD_WIDTH } from './sim/roadLayout';
 
 // --- DOM ---------------------------------------------------------------------
 const canvas = document.getElementById('scene') as HTMLCanvasElement;
@@ -45,12 +48,22 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.15;
 
 // --- Scene -------------------------------------------------------------------
-const TARGET_BUILDINGS = 500;
-const { scene, pivot, buildingCount, buildingSpecs, roadHeatmap } = buildScene(TARGET_BUILDINGS);
+// 9×3 街区的横向地图比 3×3 大一倍多，建筑数同步上调
+// 迭代 3：起始建筑数下调到 600，留一半空间给"自动生长"演示
+const TARGET_BUILDINGS = 600;
+const { scene, pivot, buildingInstances, buildingCount, buildingSpecs, roadHeatmap } = buildScene(TARGET_BUILDINGS);
 
 // --- 代理实例化网格 ---------------------------------------------------------
 const agentInstances = new AgentInstances(MAX_AGENTS);
 agentInstances.addToScene(scene);
+
+// --- 迭代 3：街区调试可视化 -------------------------------------------------
+// 用一组 PlaneGeometry 在街区底面铺一层半透明指示色（按 fulfillment 染色）
+let latestDistricts: DistrictSnapshot[] | null = null;
+let latestChain: ChainSnapshotItem[] | null = null;
+let latestLines: LineSnapshotItem[] | null = null;
+let latestProfitTick = 0;
+let latestProfitAcc = 0;
 
 // --- Sim Worker -------------------------------------------------------------
 const PRESETS = [200, 500, 1000, 1500, 2000] as const;
@@ -59,24 +72,95 @@ let activeAgents = PRESETS[currentPreset];
 
 const sim = new SimHandle({
   gridSize: GRID_SIZE,
+  gridSizeX: GRID_W,
+  gridSizeZ: GRID_D,
   seed: 42,
   buildings: buildingSpecs,
   roads: getRoadRegions(),
+  districts: getDistrictLayout(),
   maxVisibleAgents: activeAgents,
   onSnapshot: (snap) => {
     agentInstances.ingestSnapshot(snap);
     if (snap.roads) roadHeatmap.apply(snap.roads);
+    // 迭代 3：处理建筑增删差量
+    if (snap.buildingDelta) {
+      const { spawned, removed } = snap.buildingDelta;
+      for (const uid of removed) {
+        if (buildingInstances.removeByUid(uid)) growRemoveCount++;
+      }
+      for (const s of spawned) {
+        const kind = s.kind === 0 ? 'residential' : s.kind === 1 ? 'commercial' : 'industrial';
+        if (buildingInstances.add({
+          kind,
+          x: s.x, z: s.z, w: s.w, d: s.d, h: s.h,
+          seed: s.seed,
+          uid: s.uid,
+        })) growSpawnCount++;
+      }
+    }
+    if (snap.districts) latestDistricts = snap.districts;
+    if (snap.chain) latestChain = snap.chain;
+    if (snap.lines) latestLines = snap.lines;
+    if (typeof snap.profitPerTick === 'number') latestProfitTick = snap.profitPerTick;
+    if (typeof snap.profitAccumulated === 'number') latestProfitAcc = snap.profitAccumulated;
+  },
+  onRoadsChanged: (regions) => {
+    // 迭代 3 R3：worker 通知路网变化（玩家增删路），主线程重建热力图条带
+    roadHeatmap.rebuild(regions);
   },
 });
 
 // --- Camera ------------------------------------------------------------------
 const cityCam = new OrthoCityCamera({
   pivot,
-  viewSize: 18,
-  minViewSize: 6,
-  maxViewSize: 32,
+  viewSize: 36,           // 9×3 横向地图，初始视野适当拉大
+  minViewSize: 8,
+  maxViewSize: 72,
 });
 cityCam.attach(canvas);
+
+// --- 道路工具（迭代 3 · M1 + Phase 4）-------------------------------------
+// 容量密度与 scene.getRoadRegions 同口径，估算"玩家铺路"的通行容量
+const ROAD_LANE_TOTAL = ROAD_WIDTH - 2 * 0.7;
+const ROAD_CAPACITY_DENSITY = 0.6;
+const roadTool = new RoadTool({
+  scene,
+  camera: cityCam.camera,
+  canvas,
+  gridW: GRID_W,
+  gridD: GRID_D,
+  roadWidth: ROAD_WIDTH,
+  onPlace: (seg) => {
+    // 计算 capacity（与 scene.ts 同口径）
+    const length = seg.axis === 'NS' ? seg.d : seg.w;
+    const capacity = ROAD_LANE_TOTAL * length * ROAD_CAPACITY_DENSITY;
+    sim.addRoad(seg.id, {
+      x: seg.x, z: seg.z, w: seg.w, d: seg.d, capacity,
+    });
+    return true;
+  },
+  onRemove: (id) => {
+    sim.removeRoad(id);
+    return true;
+  },
+});
+
+function setActiveTool(t: Tool): void {
+  roadTool.setTool(t);
+  cityCam.setLeftButtonEnabled(t === 'select');
+  // 工具栏按钮高亮
+  for (const el of document.querySelectorAll<HTMLButtonElement>('.tool-btn')) {
+    el.classList.toggle('active', el.dataset.tool === t);
+  }
+}
+
+// 工具栏按钮 click
+for (const btn of document.querySelectorAll<HTMLButtonElement>('.tool-btn')) {
+  btn.addEventListener('click', () => {
+    const t = btn.dataset.tool as Tool;
+    setActiveTool(t);
+  });
+}
 
 // --- Pixel Pipeline（可热替换）-----------------------------------------------
 let pixelScale = 3;
@@ -110,8 +194,10 @@ extra.innerHTML = `
   <div style="margin-top:6px">
     <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>/<kbd>4</kbd> 像素比例
     &nbsp;<kbd>Q</kbd> 减色 <span id="hud-q">off</span>
-    &nbsp;<kbd>P</kbd> 暂停 <span id="hud-p">running</span>
+    &nbsp;<kbd>Space</kbd>/<kbd>P</kbd> 暂停 <span id="hud-p">1x</span>
+    &nbsp;<kbd>[</kbd>/<kbd>]</kbd> 倍速
     &nbsp;<kbd>H</kbd> 热力图 <span id="hud-h">on</span>
+    &nbsp;<kbd>B</kbd> 拓路（最堵）
   </div>
   <div style="margin-top:4px">视角 az=<span id="hud-az">—</span>° el=<span id="hud-el">—</span>°</div>
 </div>
@@ -133,12 +219,32 @@ extra.innerHTML = `
 <div style="margin-top:8px;padding-top:8px;border-top:1px solid #333a45;font-size:11px;line-height:1.6;">
   <div><b style="color:#7fd1ff">C3 · 道路压力</b></div>
   <dl style="display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0;color:#9aa3ad;">
-    <dt>NS-1 (x=10)</dt><dd id="hud-r0">—</dd>
-    <dt>NS-2 (x=22)</dt><dd id="hud-r1">—</dd>
-    <dt>EW-1 (z=10)</dt><dd id="hud-r2">—</dd>
-    <dt>EW-2 (z=22)</dt><dd id="hud-r3">—</dd>
+    <dt>南北路（8 条）</dt><dd id="hud-r-ns">—</dd>
+    <dt>东西路（2 条）</dt><dd id="hud-r-ew">—</dd>
     <dt>峰值拥堵</dt><dd id="hud-rpeak">—</dd>
+    <dt>平均通勤</dt><dd id="hud-commute">—</dd>
   </dl>
+</div>
+<div style="margin-top:8px;padding-top:8px;border-top:1px solid #333a45;font-size:11px;line-height:1.6;">
+  <div><b style="color:#7fd1ff">迭代 3 · 街区自生长</b></div>
+  <dl style="display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0;color:#9aa3ad;">
+    <dt>建筑总数</dt><dd id="hud-bcount">—</dd>
+    <dt>住宅区平均</dt><dd id="hud-d-r">—</dd>
+    <dt>商业区平均</dt><dd id="hud-d-c">—</dd>
+    <dt>工业区平均</dt><dd id="hud-d-i">—</dd>
+    <dt>近 1s 增/减</dt><dd id="hud-d-delta">—</dd>
+  </dl>
+</div>
+<div style="margin-top:8px;padding-top:8px;border-top:1px solid #333a45;font-size:11px;line-height:1.6;">
+  <div><b style="color:#7fd1ff">迭代 3 · 产业节点</b></div>
+  <div id="hud-chain" style="display:grid;grid-template-columns:1fr;gap:3px;margin:4px 0 0 0;color:#9aa3ad;font-size:10.5px;">—</div>
+</div>
+<div style="margin-top:8px;padding-top:8px;border-top:1px solid #333a45;font-size:11px;line-height:1.6;">
+  <div><b style="color:#7fd1ff">迭代 3 · 运输线</b>
+    &nbsp;本 tick <span id="hud-profit-tick">—</span>
+    &nbsp;累计 <span id="hud-profit-acc">—</span>
+  </div>
+  <div id="hud-lines" style="display:grid;grid-template-columns:1fr;gap:3px;margin:4px 0 0 0;color:#9aa3ad;font-size:10.5px;">—</div>
 </div>
 <div style="margin-top:8px;padding-top:8px;border-top:1px solid #333a45;font-size:11px;line-height:1.6;">
   <div><b style="color:#7fd1ff">B2 · 性能压测</b></div>
@@ -190,13 +296,31 @@ const hudTax = document.getElementById('hud-tax') as HTMLElement;
 
 // C3 道路压力 HUD
 const hudH = document.getElementById('hud-h') as HTMLElement;
-const hudRoads = [
-  document.getElementById('hud-r0') as HTMLElement,
-  document.getElementById('hud-r1') as HTMLElement,
-  document.getElementById('hud-r2') as HTMLElement,
-  document.getElementById('hud-r3') as HTMLElement,
-];
+const hudRoadNS = document.getElementById('hud-r-ns') as HTMLElement;
+const hudRoadEW = document.getElementById('hud-r-ew') as HTMLElement;
 const hudRPeak = document.getElementById('hud-rpeak') as HTMLElement;
+const hudCommute = document.getElementById('hud-commute') as HTMLElement;
+
+// 迭代 3 · 街区自生长 HUD
+const hudBCount = document.getElementById('hud-bcount') as HTMLElement;
+const hudDR = document.getElementById('hud-d-r') as HTMLElement;
+const hudDC = document.getElementById('hud-d-c') as HTMLElement;
+const hudDI = document.getElementById('hud-d-i') as HTMLElement;
+const hudDDelta = document.getElementById('hud-d-delta') as HTMLElement;
+
+// 迭代 3 · 产业节点 HUD
+const hudChain = document.getElementById('hud-chain') as HTMLElement;
+// 迭代 3 · 运输线 HUD
+const hudLines = document.getElementById('hud-lines') as HTMLElement;
+const hudProfitTick = document.getElementById('hud-profit-tick') as HTMLElement;
+const hudProfitAcc = document.getElementById('hud-profit-acc') as HTMLElement;
+
+// 用于统计 1 秒内 spawn / shrink 数
+let growSpawnCount = 0;
+let growRemoveCount = 0;
+let growStatAt = performance.now();
+let growSpawnDisplay = 0;
+let growRemoveDisplay = 0;
 
 hudBuildings.textContent = String(buildingCount);
 
@@ -208,6 +332,8 @@ updatePresetHUD();
 // --- 键盘快捷键 -------------------------------------------------------------
 let simPaused = false;
 let heatmapOn = true;
+const SPEEDS = [1, 2, 4] as const;
+let speedIdx = 0;       // 0→1x, 1→2x, 2→4x
 window.addEventListener('keydown', (e) => {
   if (e.key >= '1' && e.key <= '4') {
     const next = parseInt(e.key, 10);
@@ -220,11 +346,20 @@ window.addEventListener('keydown', (e) => {
     pipeline.setQuantize(quantize);
     hudQ.textContent = quantize ? 'on' : 'off';
     hudQ.style.color = quantize ? '#7fd1ff' : '#9aa3ad';
-  } else if (e.key.toLowerCase() === 'p') {
+  } else if (e.key === ' ' || e.key.toLowerCase() === 'p') {
+    e.preventDefault();
     simPaused = !simPaused;
     if (simPaused) sim.pause(); else sim.resume();
-    hudP.textContent = simPaused ? 'paused' : 'running';
+    hudP.textContent = simPaused ? 'paused' : `${SPEEDS[speedIdx]}x`;
     hudP.style.color = simPaused ? '#ffb84d' : '#6dd58c';
+  } else if (e.key === '[') {
+    if (speedIdx > 0) speedIdx--;
+    sim.setSpeed(SPEEDS[speedIdx]);
+    if (!simPaused) hudP.textContent = `${SPEEDS[speedIdx]}x`;
+  } else if (e.key === ']') {
+    if (speedIdx < SPEEDS.length - 1) speedIdx++;
+    sim.setSpeed(SPEEDS[speedIdx]);
+    if (!simPaused) hudP.textContent = `${SPEEDS[speedIdx]}x`;
   } else if (e.key.toLowerCase() === 'h') {
     heatmapOn = !heatmapOn;
     roadHeatmap.setVisible(heatmapOn);
@@ -238,6 +373,21 @@ window.addEventListener('keydown', (e) => {
       activeAgents = PRESETS[idx];
       sim.reset({ maxVisibleAgents: activeAgents });
       updatePresetHUD();
+    }
+  } else if (e.key.toLowerCase() === 'b') {
+    // E3：演示"玩家拓路"——把当前最堵的父路 capacity 翻倍
+    const snap = sim.getSnapshot();
+    if (snap?.roads) {
+      let bestId = 0;
+      let bestCong = -1;
+      const r = snap.roads;
+      const total = r.length / 2;
+      for (let i = 0; i < total; i++) {
+        const cong = r[i * 2 + 1];
+        if (cong > bestCong) { bestCong = cong; bestId = i; }
+      }
+      sim.boostRoad(bestId, 2);
+      console.log(`[E3] boosted road #${bestId} (cong=${(bestCong * 100).toFixed(0)}%) ×2`);
     }
   }
 });
@@ -312,24 +462,135 @@ function tick(now: number) {
       clockText.style.color = phaseColor;
     }
 
-    // C3 道路压力
+    // C3 道路压力（NS 8 + EW 2，按组聚合显示）
     const r = snap.roads;
     if (r) {
+      const totalRoads = r.length / 2;
+      // NS 路是前 8 条，EW 是后面 2 条（与 getRoadRegions 顺序一致）
+      const NS_COUNT = Math.min(8, totalRoads);
+      let nsFlow = 0, nsPeak = 0;
+      let ewFlow = 0, ewPeak = 0;
       let peak = 0;
-      for (let i = 0; i < 4 && i < r.length / 2; i++) {
+      for (let i = 0; i < totalRoads; i++) {
         const flow = r[i * 2] | 0;
         const cong = r[i * 2 + 1];
-        const pct = (cong * 100).toFixed(0);
-        const el = hudRoads[i];
-        if (el) {
-          el.textContent = `${flow} 人 · ${pct}%`;
-          el.style.color = cong > 0.7 ? '#ff5d4f' : cong > 0.4 ? '#fdd06a' : '#7ed085';
+        if (i < NS_COUNT) {
+          nsFlow += flow;
+          if (cong > nsPeak) nsPeak = cong;
+        } else {
+          ewFlow += flow;
+          if (cong > ewPeak) ewPeak = cong;
         }
         if (cong > peak) peak = cong;
       }
+      const fmt = (flow: number, c: number, el: HTMLElement) => {
+        const pct = (c * 100).toFixed(0);
+        el.textContent = `${flow} 人 · 峰值 ${pct}%`;
+        el.style.color = c > 0.7 ? '#ff5d4f' : c > 0.4 ? '#fdd06a' : '#7ed085';
+      };
+      fmt(nsFlow, nsPeak, hudRoadNS);
+      fmt(ewFlow, ewPeak, hudRoadEW);
       const peakPct = (peak * 100).toFixed(0);
       hudRPeak.textContent = `${peakPct}%`;
       hudRPeak.style.color = peak > 0.7 ? '#ff5d4f' : peak > 0.4 ? '#fdd06a' : '#7ed085';
+    }
+
+    // E3: 平均通勤（从 city 字段拿）
+    if (c) {
+      const tgt = c.targetCommuteSec;
+      const avg = c.avgCommuteSec;
+      if (avg > 0) {
+        hudCommute.textContent = `${avg.toFixed(1)}s / 目标 ${tgt.toFixed(0)}s`;
+        const ratio = avg / Math.max(0.01, tgt);
+        hudCommute.style.color = ratio > 1.4 ? '#ff5d4f' : ratio > 1.0 ? '#fdd06a' : '#7ed085';
+      } else {
+        hudCommute.textContent = `— / 目标 ${tgt.toFixed(0)}s`;
+        hudCommute.style.color = '#9aa3ad';
+      }
+    }
+
+    // 迭代 3：街区状态
+    if (latestDistricts && latestDistricts.length > 0) {
+      let rSum = 0, rCount = 0, rBuildings = 0;
+      let cSum = 0, cCount = 0, cBuildings = 0;
+      let iSum = 0, iCount = 0, iBuildings = 0;
+      for (const d of latestDistricts) {
+        if (d.zone === 0) { rSum += d.fulfillment; rCount++; rBuildings += d.buildings; }
+        else if (d.zone === 1) { cSum += d.fulfillment; cCount++; cBuildings += d.buildings; }
+        else { iSum += d.fulfillment; iCount++; iBuildings += d.buildings; }
+      }
+      hudBCount.textContent = `${rBuildings + cBuildings + iBuildings}（R ${rBuildings} · C ${cBuildings} · I ${iBuildings}）`;
+      const fmtFul = (sum: number, n: number, count: number, el: HTMLElement) => {
+        const avg = n > 0 ? sum / n : 0;
+        el.textContent = `${avg.toFixed(2)} （${count} 街区）`;
+        el.style.color = avg >= 0.85 ? '#7ed085' : avg <= 0.35 ? '#ff5d4f' : '#fdd06a';
+      };
+      fmtFul(rSum, rCount, rCount, hudDR);
+      fmtFul(cSum, cCount, cCount, hudDC);
+      fmtFul(iSum, iCount, iCount, hudDI);
+    }
+    // 1s 频率刷新增减
+    if (now - growStatAt >= 1000) {
+      growSpawnDisplay = growSpawnCount;
+      growRemoveDisplay = growRemoveCount;
+      growSpawnCount = 0;
+      growRemoveCount = 0;
+      growStatAt = now;
+    }
+    if (hudFrame % 6 === 0) {
+      hudDDelta.textContent = `+${growSpawnDisplay} / -${growRemoveDisplay}`;
+      hudDDelta.style.color =
+        growSpawnDisplay > growRemoveDisplay ? '#7ed085' :
+        growRemoveDisplay > growSpawnDisplay ? '#ff5d4f' : '#9aa3ad';
+    }
+
+    // 迭代 3 · 产业节点 HUD
+    if (latestChain && hudFrame % 6 === 0) {
+      const lines: string[] = [];
+      for (const n of latestChain) {
+        const inStr = n.inBuf.length === 0 ? '—'
+          : n.inBuf.map((b) => `${b.res}:${Math.round(b.qty)}`).join(' ');
+        const outStr = n.outBuf.length === 0 ? '—'
+          : n.outBuf.map((b) => `${b.res}:${Math.round(b.qty)}`).join(' ');
+        const lvlColor = n.level >= 3 ? '#7ed085' : n.level === 2 ? '#fdd06a' : '#9aa3ad';
+        lines.push(
+          `<div>` +
+          `<span style="color:#7fd1ff">${n.producerId}</span> ` +
+          `<span style="color:${lvlColor}">L${n.level}</span>` +
+          ` <span style="color:#666;font-size:10px">in</span> ${inStr}` +
+          ` <span style="color:#666;font-size:10px">out</span> ${outStr}` +
+          `</div>`,
+        );
+      }
+      hudChain.innerHTML = lines.join('') || '—';
+    }
+
+    // 迭代 3 · 运输线 HUD
+    if (hudFrame % 6 === 0) {
+      const pt = latestProfitTick;
+      const pa = latestProfitAcc;
+      hudProfitTick.textContent = pt.toFixed(2);
+      hudProfitTick.style.color = pt > 0 ? '#7ed085' : pt < 0 ? '#ff9a55' : '#9aa3ad';
+      hudProfitAcc.textContent = pa.toFixed(0);
+      hudProfitAcc.style.color = pa > 0 ? '#7ed085' : pa < 0 ? '#ff5d4f' : '#9aa3ad';
+      if (latestLines && latestLines.length > 0) {
+        const rows: string[] = [];
+        for (const l of latestLines) {
+          const profitColor = l.revenue > 0 ? '#7ed085' : l.revenue < 0 ? '#ff9a55' : '#9aa3ad';
+          rows.push(
+            `<div>` +
+            `<span style="color:#7fd1ff">#${l.id}</span> ` +
+            `${l.resource} · ` +
+            `<span style="color:#aaa">${l.vehicleId}×${l.fleet}</span> · ` +
+            `送达 ${Math.round(l.delivered)} · ` +
+            `<span style="color:${profitColor}">利 ${l.revenue.toFixed(1)}</span>` +
+            `</div>`,
+          );
+        }
+        hudLines.innerHTML = rows.join('');
+      } else {
+        hudLines.innerHTML = '—';
+      }
     }
   }
 

@@ -43,6 +43,16 @@ export class BuildingInstances {
   private capacity: number;
   private roofCount = 0;
 
+  /**
+   * 迭代 3：每类墙体下，slot 索引 → uid 反查，用于 removeByUid 时找到对应 instance。
+   * uid=0 表示该 slot 空闲。
+   */
+  private wallUidByKind = new Map<BuildingKind, Int32Array>();
+  /** uid → { kind, wallSlot, roofSlot } 反查（迭代 3）。 */
+  private byUid = new Map<number, { kind: BuildingKind; wallSlot: number; roofSlot: number }>();
+  /** 每个 roof slot 是否在用（迭代 3）。 */
+  private roofUsed: Uint8Array;
+
   constructor(capacity: number) {
     this.capacity = capacity;
     this.group = new THREE.Group();
@@ -55,13 +65,14 @@ export class BuildingInstances {
     for (const kind of ['residential', 'commercial', 'industrial'] as const) {
       const mat = new THREE.MeshLambertMaterial({ flatShading: true });
       const mesh = new THREE.InstancedMesh(wallGeom, mat, capacity);
-      mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       mesh.instanceColor = new THREE.InstancedBufferAttribute(
         new Float32Array(capacity * 3),
         3,
       );
       mesh.count = 0;
       this.wallsMesh.set(kind, mesh);
+      this.wallUidByKind.set(kind, new Int32Array(capacity));
       this.group.add(mesh);
     }
 
@@ -70,31 +81,44 @@ export class BuildingInstances {
     roofGeom.translate(0, 0.5, 0);
     const roofMat = new THREE.MeshLambertMaterial({ flatShading: true });
     this.roofMesh = new THREE.InstancedMesh(roofGeom, roofMat, capacity * 3);
-    this.roofMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    this.roofMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.roofMesh.instanceColor = new THREE.InstancedBufferAttribute(
       new Float32Array(capacity * 3 * 3),
       3,
     );
     this.roofMesh.count = 0;
+    this.roofUsed = new Uint8Array(capacity * 3);
     this.group.add(this.roofMesh);
   }
 
-  /** 一次性提交一组建筑（C 阶段会改成增量 add/remove）。 */
-  setBuildings(specs: BuildingSpec[]): void {
-    // 按 kind 分组
-    const byKind: Record<BuildingKind, BuildingSpec[]> = {
+  /**
+   * 一次性提交一组建筑。
+   *
+   * 迭代 3：specs 现在可以带可选 `uid` 字段——如果不带，按 (i+1) 兜底。
+   * 这样初始建筑就能通过 uid 与 sim 侧的 BuildingStore.uid 对应起来。
+   *
+   * @param uidStart 起始 uid（与 sim 侧 buildingStore.uid 同步；默认 1）
+   */
+  setBuildings(specs: BuildingSpec[], uidStart = 1): void {
+    // 按 kind 分组，同时记录 uid（spec 顺序 = sim 侧 spawn 顺序）
+    const byKind: Record<BuildingKind, Array<BuildingSpec & { uid: number }>> = {
       residential: [],
       commercial: [],
       industrial: [],
     };
-    for (const s of specs) {
-      byKind[s.kind].push(s);
+    for (let i = 0; i < specs.length; i++) {
+      const s = specs[i];
+      byKind[s.kind].push({ ...s, uid: uidStart + i });
     }
 
     this.roofCount = 0;
+    this.byUid.clear();
+    this.roofUsed.fill(0);
 
     for (const kind of ['residential', 'commercial', 'industrial'] as const) {
       const mesh = this.wallsMesh.get(kind)!;
+      const uidArr = this.wallUidByKind.get(kind)!;
+      uidArr.fill(0);
       const list = byKind[kind];
       const n = Math.min(list.length, this.capacity);
 
@@ -108,6 +132,7 @@ export class BuildingInstances {
         mesh.setMatrixAt(i, DUMMY.matrix);
         COLOR.setHex(pickWall(kind, s.seed));
         mesh.setColorAt(i, COLOR);
+        uidArr[i] = s.uid;
 
         // 屋顶：略大于墙体，薄板
         DUMMY.position.set(s.x + s.w / 2, s.h, s.z + s.d / 2);
@@ -116,6 +141,9 @@ export class BuildingInstances {
         this.roofMesh.setMatrixAt(this.roofCount, DUMMY.matrix);
         COLOR.setHex(pickRoof(kind));
         this.roofMesh.setColorAt(this.roofCount, COLOR);
+        this.roofUsed[this.roofCount] = 1;
+
+        this.byUid.set(s.uid, { kind, wallSlot: i, roofSlot: this.roofCount });
         this.roofCount++;
       }
 
@@ -127,6 +155,87 @@ export class BuildingInstances {
     this.roofMesh.count = this.roofCount;
     this.roofMesh.instanceMatrix.needsUpdate = true;
     if (this.roofMesh.instanceColor) this.roofMesh.instanceColor.needsUpdate = true;
+  }
+
+  /**
+   * 迭代 3：增量添加一栋建筑。
+   * @returns true 表示成功；false 表示对应 kind 容量已满。
+   */
+  add(spec: BuildingSpec & { uid: number }): boolean {
+    const mesh = this.wallsMesh.get(spec.kind)!;
+    const uidArr = this.wallUidByKind.get(spec.kind)!;
+    if (mesh.count >= this.capacity) return false;
+    // 找空 slot：优先复用 uid=0 的位置
+    let slot = -1;
+    for (let i = 0; i < mesh.count; i++) {
+      if (uidArr[i] === 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+      slot = mesh.count;
+      mesh.count = slot + 1;
+    }
+
+    DUMMY.position.set(spec.x + spec.w / 2, 0, spec.z + spec.d / 2);
+    DUMMY.scale.set(spec.w * 0.86, spec.h, spec.d * 0.86);
+    DUMMY.rotation.set(0, 0, 0);
+    DUMMY.updateMatrix();
+    mesh.setMatrixAt(slot, DUMMY.matrix);
+    COLOR.setHex(pickWall(spec.kind, spec.seed));
+    mesh.setColorAt(slot, COLOR);
+    uidArr[slot] = spec.uid;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+    // 屋顶 slot：先找空闲
+    let roofSlot = -1;
+    for (let i = 0; i < this.roofCount; i++) {
+      if (!this.roofUsed[i]) { roofSlot = i; break; }
+    }
+    if (roofSlot < 0) {
+      if (this.roofCount >= this.capacity * 3) {
+        return false; // 屋顶满
+      }
+      roofSlot = this.roofCount++;
+      this.roofMesh.count = this.roofCount;
+    }
+    DUMMY.position.set(spec.x + spec.w / 2, spec.h, spec.z + spec.d / 2);
+    DUMMY.scale.set(spec.w * 0.86 + 0.08, 0.12, spec.d * 0.86 + 0.08);
+    DUMMY.updateMatrix();
+    this.roofMesh.setMatrixAt(roofSlot, DUMMY.matrix);
+    COLOR.setHex(pickRoof(spec.kind));
+    this.roofMesh.setColorAt(roofSlot, COLOR);
+    this.roofUsed[roofSlot] = 1;
+    this.roofMesh.instanceMatrix.needsUpdate = true;
+    if (this.roofMesh.instanceColor) this.roofMesh.instanceColor.needsUpdate = true;
+
+    this.byUid.set(spec.uid, { kind: spec.kind, wallSlot: slot, roofSlot });
+    return true;
+  }
+
+  /**
+   * 迭代 3：按 uid 移除一栋建筑。把对应 slot 的 matrix 缩到 0 并清 uid 标记，
+   * 等下次 add 复用。
+   */
+  removeByUid(uid: number): boolean {
+    const entry = this.byUid.get(uid);
+    if (!entry) return false;
+    const mesh = this.wallsMesh.get(entry.kind)!;
+    const uidArr = this.wallUidByKind.get(entry.kind)!;
+
+    DUMMY.position.set(0, -1000, 0);
+    DUMMY.scale.set(0.0001, 0.0001, 0.0001);
+    DUMMY.rotation.set(0, 0, 0);
+    DUMMY.updateMatrix();
+    mesh.setMatrixAt(entry.wallSlot, DUMMY.matrix);
+    uidArr[entry.wallSlot] = 0;
+    mesh.instanceMatrix.needsUpdate = true;
+
+    this.roofMesh.setMatrixAt(entry.roofSlot, DUMMY.matrix);
+    this.roofUsed[entry.roofSlot] = 0;
+    this.roofMesh.instanceMatrix.needsUpdate = true;
+
+    this.byUid.delete(uid);
+    return true;
   }
 
   /** 当前总建筑数（墙体 + 屋顶 = 各类墙体之和）。 */

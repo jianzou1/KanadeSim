@@ -39,10 +39,12 @@ export const enum AgentState {
   // 其余状态留位，C 阶段补
 }
 
-/** 代理类型（C3.2 加车辆）。 */
+/** 代理类型（C3.2 加车辆；迭代 3 C3 加货车）。 */
 export const enum AgentKind {
   Walker = 0,
   Driver = 1,
+  /** 迭代 3 C3：货车，沿 RoadGraph 跑 src→dst 循环，载货 */
+  Truck = 2,
 }
 
 // === 快照协议（Worker → Main，每帧一次）=====================================
@@ -73,6 +75,91 @@ export interface SimSnapshot {
   roads: Float32Array | null;
   /** 本帧是否刚刚重采样了代理（C3.3）。主线程收到 true 时应跳过 prev/curr lerp，直接 snap。 */
   respawned: boolean;
+  /**
+   * 迭代 3 · 建筑增删差量。
+   * 主线程根据 spawned/removed 列表调用 BuildingInstances 同步渲染。
+   * 仅在本 tick 有变化时非空；多数 tick 这两个字段为 undefined。
+   */
+  buildingDelta?: {
+    spawned: BuildingDelta[];
+    removed: number[];     // building uid 列表（主线程根据 uid 找到对应 instance）
+  };
+  /**
+   * 迭代 3 · 街区调试信息（每 tick 推送，让 HUD 能看到 fulfillment 趋势）。
+   * 数量小（< 50），用普通对象数组传输即可。
+   */
+  districts?: DistrictSnapshot[];
+  /**
+   * 迭代 3 · Phase 2 · 产业节点快照（HUD/调试用）。
+   */
+  chain?: ChainSnapshotItem[];
+  /**
+   * 迭代 3 · Phase 2 · C3 运输线快照（HUD/调试用）。
+   */
+  lines?: LineSnapshotItem[];
+  /** 迭代 3 · Phase 2 · C3 本 tick 净利润（rev - maintenance） */
+  profitPerTick?: number;
+  /** 迭代 3 · Phase 2 · C3 累计净利润 */
+  profitAccumulated?: number;
+}
+
+/** 产业节点 HUD 快照。 */
+export interface ChainSnapshotItem {
+  id: number;
+  producerId: string;
+  buildingIdx: number;
+  level: 1 | 2 | 3 | 4;
+  x: number;
+  z: number;
+  /** 关键 resource → 数量；只列非零项 */
+  inBuf: Array<{ res: string; qty: number }>;
+  outBuf: Array<{ res: string; qty: number }>;
+  goodTicks: number;
+  badTicks: number;
+}
+
+/** 运输线 HUD 快照。 */
+export interface LineSnapshotItem {
+  id: number;
+  resource: string;
+  vehicleId: string;
+  fleet: number;
+  /** 本生命周期累计利润（含维护成本） */
+  revenue: number;
+  /** 本生命周期累计运到的货物数 */
+  delivered: number;
+  /** 鸟瞰距离 */
+  aerial: number;
+  dstKind: 'producer' | 'town';
+}
+
+/** 新增建筑的最小描述，主线程据此 setMatrixAt + setColorAt。 */
+export interface BuildingDelta {
+  uid: number;          // 建筑唯一 ID（生命周期内不变）
+  kind: 0 | 1 | 2;      // 0=residential, 1=commercial, 2=industrial
+  x: number;
+  z: number;
+  w: number;
+  d: number;
+  h: number;
+  seed: number;         // 调色用
+  bornTick: number;
+}
+
+/** 街区快照（仅 HUD/调试用）。 */
+export interface DistrictSnapshot {
+  id: number;
+  col: number;
+  row: number;
+  zone: 0 | 1 | 2;
+  bx: number;
+  bz: number;
+  bw: number;
+  bd: number;
+  buildings: number;
+  demand: number;
+  supplied: number;
+  fulfillment: number;
 }
 
 /**
@@ -94,6 +181,10 @@ export interface CityMetricsSnapshot {
   driverRate: number;          // 0-1（C3.2 新增）
   /** 当前模拟时刻（24h 制 0-23.999） */
   hour: number;
+  /** E3 新增：平均通勤秒数 */
+  avgCommuteSec: number;
+  /** E3 新增：通勤目标秒数（容忍上限） */
+  targetCommuteSec: number;
 }
 
 /** Worker 计算耗时统计（HUD 用）。 */
